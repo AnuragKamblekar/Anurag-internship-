@@ -1,0 +1,277 @@
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from scipy.fftpack import fft, fftfreq
+from scipy.stats import skew, kurtosis
+import pywt
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import silhouette_score
+
+
+class IMUAnalyzer:
+    def __init__(self, relativepath, selectedcolumns=None, sampling_rate=1.0, horizon=50):
+        basedir = os.path.dirname(__file__)
+        self.filepath = os.path.join(basedir, relativepath)
+        self.data = pd.read_csv(self.filepath)
+        self.selectedcolumns = selectedcolumns if selectedcolumns else list(self.data.columns)
+        self.sampling_rate = sampling_rate
+        self.horizon = horizon
+        self.stateestimates = []
+
+    # ---- Combined waveform plot + feature extraction ----
+    def waveform_analysis(self):
+     for col in self.selectedcolumns:
+        signal = self.data[col].values
+
+        # Create a new figure for each column
+        plt.figure(figsize=(10, 4))
+        plt.plot(self.data.index, signal)
+        plt.title(f"Waveform of {col}")
+        plt.xlabel("Sample Index (time steps)")
+        plt.ylabel("Value")
+        plt.grid(True)
+
+        # Compute features
+        feats = {
+            "mean": np.mean(signal),
+            "std": np.std(signal),
+            "max": np.max(signal),
+            "min": np.min(signal),
+            "skewness": skew(signal),
+            "kurtosis": kurtosis(signal)
+        }
+
+        # Annotate features inside the plot
+        textstr = "\n".join([f"{k}: {v:.3f}" for k, v in feats.items()])
+        plt.text(0.01, 0.95, textstr,
+                 transform=plt.gca().transAxes,
+                 fontsize=9,
+                 verticalalignment='top',
+                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+        plt.tight_layout()
+        plt.show()
+        #return features
+
+    # ---- FFT plots ----
+
+    def fft(self):
+     N = len(self.data)
+     T = 1.0 / self.sampling_rate
+
+     for col in self.selectedcolumns:
+        signal = self.data[col].values
+        fft_vals = fft(signal)
+        fft_freqs = fftfreq(N, T)[:N//2]
+        magnitudes = 2.0/N * np.abs(fft_vals[:N//2])
+
+        # Create a new figure for each column
+        plt.figure(figsize=(10, 4))
+        plt.plot(fft_freqs, magnitudes)
+        plt.title(f"FFT Spectrum of {col}")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Magnitude")
+        plt.grid(True)
+
+        # Extract dominant frequency feature
+        dominant_idx = np.argmax(magnitudes)
+        dominant_freq = fft_freqs[dominant_idx]
+        dominant_mag = magnitudes[dominant_idx]
+
+        # Annotate inside the plot
+        textstr = f"Dominant Freq: {dominant_freq:.2f} Hz\nMagnitude: {dominant_mag:.3f}"
+        plt.text(0.01, 0.95, textstr,
+                 transform=plt.gca().transAxes,
+                 fontsize=9,
+                 verticalalignment='top',
+                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+        plt.tight_layout()
+        plt.show()
+
+
+    # ---- Moving Horizon Estimation ----
+    def moving_horizon_estimate(self, columnname="AccX"):
+        datastream = self.data[columnname].values
+        self.stateestimates = []
+        for i in range(len(datastream) - self.horizon):
+            window = datastream[i:i+self.horizon]
+            meanval = np.mean(window)
+            varval = np.var(window)
+            state = np.array([meanval, varval])
+            self.stateestimates.append(state)
+        return np.array(self.stateestimates)
+
+    def latest_state(self):
+        return self.stateestimates[-1] if self.stateestimates else None
+    
+    def histogram(self, bins=30):
+       for col in self.selectedcolumns:
+          signal = self.data[col].values
+
+          plt.figure(figsize=(10, 4))
+          plt.hist(signal, bins=bins, color="skyblue", edgecolor="black")
+          plt.title(f"HIstogram of {col}")
+          plt.xlabel("Value")
+          plt.ylabel("Frequency")
+          plt.grid(True)
+
+          feats = {
+             "mean": np.mean(signal),
+             "std": np.std(signal),
+             "skewness": skew(signal),
+             "kurtosis": kurtosis(signal)
+          }
+
+          textstr = "\n".join([f"{k}: {v:.3f}" for k, v in feats.items()])
+          plt.text(0.95, 0.95, textstr,
+                   transform = plt.gca().transAxes,
+                   fontsize = 9,
+                   verticalalignment = "top",
+                   horizontalalignment = "right",
+                   bbox = dict(boxstyle = "round", facecolor = "wheat", alpha=0.5))
+          plt.tight_layout()
+          plt.show()
+    
+    def denoising(self, wavelet="db4", level=3):
+      for col in self.selectedcolumns:
+        signal = np.array(self.data[col].values, dtype=float, copy=True)
+        coeffs = pywt.wavedec(signal, wavelet, level=level)
+        sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+        threshold = sigma * np.sqrt(2 * np.log(len(signal)))
+        coeffs_thresh = [coeffs[0]] + [pywt.threshold(c, threshold, mode="soft") for c in coeffs[1:]]
+        denoised_signal = pywt.waverec(coeffs_thresh, wavelet)
+
+        # ✅ use underscore consistently
+        self.data[f"{col}_denoised"] = denoised_signal[:len(signal)]
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(self.data.index, signal, label="Original", alpha=0.6)
+        plt.plot(self.data.index, self.data[f"{col}_denoised"], label="Denoised", linewidth=2)
+        plt.title(f"Wavelet Denoising of {col}")
+        plt.xlabel("Sample Index")
+        plt.ylabel("Value")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+      return denoised_signal
+
+    
+    def supervised(self, labels):
+      # ✅ now matches the naming convention
+     X = self.data[[f"{col}_denoised" for col in self.selectedcolumns]].values
+     y = labels
+     clf = GradientBoostingClassifier(random_state=42)
+     clf.fit(X, y)
+     ypred = clf.predict(X)
+     
+     print("Gradient Boosting Accuracy:", clf.score(X, y))
+     print("Confusion Matrix:\n", confusion_matrix(y, ypred))
+     print("Classification Report:\n", classification_report(y, ypred))
+
+     importances = clf.feature_importances_
+     feature_names = [f"{col}_denoised" for col in self.selectedcolumns]
+
+     plt.figure(figsize=(8, 5))
+     plt.bar(range(len(importances)), importances, tick_label = feature_names)
+     plt.title(" Feature Importance (Gradient Boosting)")
+     plt.ylabel("Importance")
+     plt.xticks(rotation=45)
+     plt.tight_layout()
+     plt.show()
+
+     return clf, ypred
+    
+    def supervisedhist(self, labels):
+       X = self.data[[f"{col}_denoised" for col in self.selectedcolumns]].values
+       y = labels
+       clf = HistGradientBoostingClassifier(random_state=42)
+       clf.fit(X, y)
+       ypred = clf.predict(X)
+
+       print(" HistGradientBoosting Accuracy:", clf.score(X, y))
+       print(" Confusion Matrix:\n", confusion_matrix(y, ypred))
+       print(" Classification Report:\n", classification_report(y, ypred))
+       
+       result = permutation_importance(clf, X, y, n_repeats=10, random_state=42)
+       importances = result.importances_mean
+       feature_names = [f"{col}_denoised" for col in self.selectedcolumns]
+
+       plt.figure(figsize=(8, 5))
+       plt.bar(range(len(importances)), importances, tick_label = feature_names)
+       plt.title(" Feature Importance (HistGradientBoosting)")
+       plt.ylabel("Importance")
+       plt.xticks(rotation=45)
+       plt.tight_layout()
+       plt.show()
+       return clf, ypred
+    
+    def unsupervised(self, n_clusters = 3):
+       X = self.data[[f"{col}_denoised" for col in self.selectedcolumns]].values
+       kmeans = KMeans(n_clusters = n_clusters, random_state=42)
+       clusters = kmeans.fit_predict(X)
+       score = silhouette_score(X, clusters)
+       print(f"KMeans clustering done with {n_clusters} clusters")
+       print("Silhouette Score:", score)
+
+       pca = PCA(n_components=2)
+       reduced = pca.fit_transform(X)
+       clusternames = {0: "Cluster A", 1: "Cluster B", 2: "Cluster C"}
+       plt.figure(figsize=(8, 6))
+       for clusterid in np.unique(clusters):
+          plt.scatter(
+             reduced[clusters == clusterid, 0],
+             reduced[clusters == clusterid, 1],
+             label = clusternames.get(clusterid, f"Cluster {clusterid}"),
+             s=20
+          )
+       plt.title("Unsupervised Clustering (PCA + KMeans)")
+       plt.xlabel("PCA Component 1")
+       plt.ylabel("PCA Component 2")
+       plt.legend()
+       plt.tight_layout()
+       plt.show()
+
+       return clusters, score
+
+# ------------------ Example Usage ------------------
+if __name__ == "__main__":
+    analyzer = IMUAnalyzer("sensor_raw.csv",
+                           selectedcolumns=["AccX", "AccY", "AccZ", "GyroX", "GyroY", "GyroZ"],
+                           sampling_rate=100.0,
+                           horizon=50)
+
+    # Combined waveform plot + feature extraction
+    features = analyzer.waveform_analysis()
+    print("Waveform features:", features)
+
+    # FFT plots
+    analyzer.fft()
+
+    # Moving Horizon Estimation
+    states = analyzer.moving_horizon_estimate(columnname="AccX")
+    print("Number of state estimates:", len(states))
+    print("Latest state:", analyzer.latest_state())
+
+    analyzer.histogram(bins=30)
+
+    analyzer.denoising()
+
+    dummylabels = np.random.randint(0, 2, size=len(analyzer.data))
+    analyzer.supervised(dummylabels)
+    analyzer.supervisedhist(dummylabels)
+    #analyzer.supervisedhist(dummylabels)
+
+    clusters, score = analyzer.unsupervised(n_clusters=3)
+    print("Cluster assignments (first 20):", clusters[:20])
+    #clf, preds = analyzer.supervised(dummylabels)
